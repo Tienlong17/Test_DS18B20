@@ -1,32 +1,20 @@
-# Test_DS18B20
-temperature DS18B20
-import glob, time
+#!/usr/bin/env python3
+from w1thermsensor import W1ThermSensor, Unit
+import time
 
-# Thư mục chứa các device 1-Wire
-base_dir = "/sys/bus/w1/devices/"
-device_folders = glob.glob(base_dir + "28*")
-device_files = [d + "/w1_slave" for d in device_folders]
+# Khởi tạo: tự động phát hiện tất cả DS18B20 trên bus GPIO10
+sensors = W1ThermSensor.get_available_sensors()
 
-def read_temp_raw(device_file):
-    with open(device_file, 'r') as f:
-        return f.readlines()
-
-def read_temp(device_file):
-    lines = read_temp_raw(device_file)
-    # chờ đến khi CRC ok ("YES")
-    while lines[0].strip()[-3:] != "YES":
-        time.sleep(0.05)
-        lines = read_temp_raw(device_file)
-    # phân tích giá trị sau "t="
-    temp_str = lines[1].split("t=")[1]
-    return float(temp_str) / 1000.0
+print(f"Found {len(sensors)} sensor(s):")
+for sensor in sensors:
+    print("  •", sensor.id)
 
 try:
     while True:
-        ts = time.strftime("%Y-%m-%d %H:%M:%S")
-        for df in device_files:
-            temp = read_temp(df)
-            print(f"{ts} | {df.split('/')[-2]} = {temp:.2f}°C")
-        time.sleep(1)
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        for sensor in sensors:
+            temp_c = sensor.get_temperature(Unit.DEGREES_C)
+            print(f"{timestamp} | {sensor.id} = {temp_c:.2f} °C")
+        time.sleep(1)  # đọc mỗi giây
 except KeyboardInterrupt:
-    pass
+    print("Stopped by user")
