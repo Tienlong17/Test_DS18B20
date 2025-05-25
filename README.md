@@ -1,52 +1,166 @@
-#!/usr/bin/env python3
-import glob
-import time
-import os
+// File: ds18b20_onwire.c
+// Compile: gcc -O2 -o ds18b20_onwire ds18b20_onwire.c -lrt
 
-# Thư mục sysfs của 1-Wire
-BASE_DIR = "/sys/bus/w1/devices/"
-# Tất cả device DS18B20 bắt đầu bằng "28-"
-device_folders = glob.glob(os.path.join(BASE_DIR, "28*"))
-device_files = [os.path.join(folder, "w1_slave") for folder in device_folders]
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <time.h>
+#include <unistd.h>
 
-def read_raw(device_file):
-    """Đọc 2 dòng thô từ w1_slave."""
-    with open(device_file, "r") as f:
-        return f.readlines()
+#define GPIO_BASE      0x3F200000UL
+#define BLOCK_SIZE     (4*1024)
+#define GPIO_PIN       10   // DQ trên GPIO10
 
-def read_temp(device_file):
-    """
-    Chờ đến khi CRC OK ("YES"), rồi parse giá trị sau 't='
-    Trả về nhiệt độ (°C, float).
-    """
-    lines = read_raw(device_file)
-    # Nếu CRC chưa OK, chờ và đọc lại
-    while lines[0].strip()[-3:] != "YES":
-        time.sleep(0.1)
-        lines = read_raw(device_file)
-    # Lấy phần t=xxxxx
-    temp_str = lines[1].split("t=")[-1]
-    return float(temp_str) / 1000.0
+volatile uint32_t *gpio;
 
-def main(poll_interval=1.0):
-    if not device_files:
-        print("Không tìm thấy DS18B20 nào trên bus 1-Wire.")
-        return
+// helpers for delays
+static void udelay(unsigned us) {
+    struct timespec ts = {
+        .tv_sec = 0,
+        .tv_nsec = us * 1000
+    };
+    nanosleep(&ts, NULL);
+}
 
-    print(f"Tìm thấy {len(device_files)} sensor:")
-    for df in device_files:
-        print("  •", os.path.basename(os.path.dirname(df)))
+// set GPIO_PIN mode: 0=input, 1=output
+static void gpio_mode(int pin, int is_output) {
+    uint32_t reg = pin / 10;
+    uint32_t shift = (pin % 10) * 3;
+    uint32_t val = gpio[reg];
+    val &= ~(7 << shift);
+    if (is_output) val |= (1 << shift);
+    gpio[reg] = val;
+}
 
-    try:
-        while True:
-            timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-            for df in device_files:
-                sensor_id = os.path.basename(os.path.dirname(df))
-                temp_c = read_temp(df)
-                print(f"{timestamp} | {sensor_id} = {temp_c:.3f} °C")
-            time.sleep(poll_interval)
-    except KeyboardInterrupt:
-        print("\nDừng chương trình.")
+// write pin: 0=low, 1=high (hi-Z for 1-wire)
+static void gpio_write(int pin, int value) {
+    if (value) {
+        // set to input (hi-Z) để pull-up kéo lên
+        gpio_mode(pin, 0);
+    } else {
+        // drive low
+        gpio_mode(pin, 1);
+        gpio[(pin/32)+7] = 1 << (pin%32);  // GPCLR0
+    }
+}
 
-if __name__ == "__main__":
-    main()
+// read pin
+static int gpio_read(int pin) {
+    uint32_t lvl = gpio[(pin/32)+13];  // GPLEV0
+    return (lvl & (1 << pin)) != 0;
+}
+
+// 1-Wire reset + presence
+static int ow_reset(void) {
+    int present;
+    gpio_write(GPIO_PIN, 0);   // pull DQ low
+    udelay(480);
+    gpio_write(GPIO_PIN, 1);   // release
+    udelay(70);
+    present = !gpio_read(GPIO_PIN); // presence = low
+    udelay(410);
+    return present;
+}
+
+// write 1 bit
+static void ow_write_bit(int bit) {
+    gpio_write(GPIO_PIN, 0);
+    if (bit) {
+        udelay(6);
+        gpio_write(GPIO_PIN, 1);
+        udelay(64);
+    } else {
+        udelay(60);
+        gpio_write(GPIO_PIN, 1);
+        udelay(10);
+    }
+}
+
+// read 1 bit
+static int ow_read_bit(void) {
+    int bit;
+    gpio_write(GPIO_PIN, 0);
+    udelay(6);
+    gpio_write(GPIO_PIN, 1);
+    udelay(9);
+    bit = gpio_read(GPIO_PIN);
+    udelay(55);
+    return bit;
+}
+
+// write one byte, LSB first
+static void ow_write_byte(uint8_t b) {
+    for (int i = 0; i < 8; i++) {
+        ow_write_bit(b & 1);
+        b >>= 1;
+    }
+}
+
+// read one byte, LSB first
+static uint8_t ow_read_byte(void) {
+    uint8_t b = 0;
+    for (int i = 0; i < 8; i++) {
+        if (ow_read_bit()) b |= (1 << i);
+    }
+    return b;
+}
+
+// read temperature from DS18B20 (skip ROM)
+float ds18b20_read_temp(void) {
+    uint8_t temp_lsb, temp_msb;
+    if (!ow_reset()) {
+        fprintf(stderr, "No device present!\n");
+        return NAN;
+    }
+    ow_write_byte(0xCC);  // Skip ROM
+    ow_write_byte(0x44);  // Convert T
+    // wait conversion: tối đa 750ms cho 12-bit
+    usleep(750000);
+
+    if (!ow_reset()) {
+        fprintf(stderr, "No device on read!\n");
+        return NAN;
+    }
+    ow_write_byte(0xCC);
+    ow_write_byte(0xBE);  // Read Scratchpad
+
+    temp_lsb = ow_read_byte();
+    temp_msb = ow_read_byte();
+    // bỏ qua 7 byte còn lại (CRC...)
+    for (int i = 0; i < 7; i++) ow_read_byte();
+
+    int16_t raw = (temp_msb << 8) | temp_lsb;
+    return raw / 16.0f;   // 12-bit resolution
+}
+
+int main() {
+    int mem_fd;
+    void *gpio_map;
+
+    // mở /dev/gpiomem để mmap
+    if ((mem_fd = open("/dev/gpiomem", O_RDWR | O_SYNC)) < 0) {
+        perror("open /dev/gpiomem");
+        return 1;
+    }
+    gpio_map = mmap(NULL, BLOCK_SIZE, PROT_READ|PROT_WRITE, MAP_SHARED, mem_fd, 0);
+    close(mem_fd);
+    if (gpio_map == MAP_FAILED) {
+        perror("mmap");
+        return 1;
+    }
+    gpio = (volatile uint32_t *)gpio_map;
+
+    // main loop
+    while (1) {
+        float temp = ds18b20_read_temp();
+        if (!isnan(temp)) {
+            printf("Temperature: %.3f °C\n", temp);
+        }
+        sleep(1);
+    }
+
+    munmap(gpio_map, BLOCK_SIZE);
+    return 0;
+}
