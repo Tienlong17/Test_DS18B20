@@ -1,166 +1,118 @@
-// File: ds18b20_onwire.c
-// Compile: gcc -O2 -o ds18b20_onwire ds18b20_onwire.c -lrt
+import RPi.GPIO as GPIO
+import time
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <stdint.h>
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <time.h>
-#include <unistd.h>
+# Pin 1-Wire (DQ) nối vào GPIO4 (BCM)
+PIN = 4
 
-#define GPIO_BASE      0x3F200000UL
-#define BLOCK_SIZE     (4*1024)
-#define GPIO_PIN       10   // DQ trên GPIO10
+# Các lệnh ROM + Function
+SKIP_ROM        = 0xCC
+CONVERT_T       = 0x44
+READ_SCRATCHPAD = 0xBE
 
-volatile uint32_t *gpio;
+# Delay helper (micro giây)
+def usleep(micro):
+    time.sleep(micro / 1_000_000.0)
 
-// helpers for delays
-static void udelay(unsigned us) {
-    struct timespec ts = {
-        .tv_sec = 0,
-        .tv_nsec = us * 1000
-    };
-    nanosleep(&ts, NULL);
-}
+def init_gpio():
+    GPIO.setmode(GPIO.BCM)
+    GPIO.setup(PIN, GPIO.OUT, initial=GPIO.HIGH)
 
-// set GPIO_PIN mode: 0=input, 1=output
-static void gpio_mode(int pin, int is_output) {
-    uint32_t reg = pin / 10;
-    uint32_t shift = (pin % 10) * 3;
-    uint32_t val = gpio[reg];
-    val &= ~(7 << shift);
-    if (is_output) val |= (1 << shift);
-    gpio[reg] = val;
-}
+def deinit_gpio():
+    GPIO.cleanup()
 
-// write pin: 0=low, 1=high (hi-Z for 1-wire)
-static void gpio_write(int pin, int value) {
-    if (value) {
-        // set to input (hi-Z) để pull-up kéo lên
-        gpio_mode(pin, 0);
-    } else {
-        // drive low
-        gpio_mode(pin, 1);
-        gpio[(pin/32)+7] = 1 << (pin%32);  // GPCLR0
-    }
-}
+def reset_pulse():
+    """ Master kéo bus xuống 0 ít nhất 480µs, sau đó lên 1 và chờ presence """
+    GPIO.setup(PIN, GPIO.OUT)
+    GPIO.output(PIN, GPIO.LOW)
+    usleep(500)              # ≥480µs
+    GPIO.output(PIN, GPIO.HIGH)
+    usleep(70)               # Chờ presence window
+    GPIO.setup(PIN, GPIO.IN) # Đọc presence
+    presence = GPIO.input(PIN) == 0
+    usleep(410)              # Hoàn tất slot
+    return presence
 
-// read pin
-static int gpio_read(int pin) {
-    uint32_t lvl = gpio[(pin/32)+13];  // GPLEV0
-    return (lvl & (1 << pin)) != 0;
-}
+def write_bit(bit):
+    """ Ghi 1 bit lên bus """
+    GPIO.setup(PIN, GPIO.OUT)
+    GPIO.output(PIN, GPIO.LOW)
+    if bit:
+        # Ghi “1”: giữ 1–15µs rồi release, rest of slot high
+        usleep(10)
+        GPIO.output(PIN, GPIO.HIGH)
+        usleep(55)
+    else:
+        # Ghi “0”: giữ 60µs, sau đó release
+        usleep(65)
+        GPIO.output(PIN, GPIO.HIGH)
+        usleep(5)
 
-// 1-Wire reset + presence
-static int ow_reset(void) {
-    int present;
-    gpio_write(GPIO_PIN, 0);   // pull DQ low
-    udelay(480);
-    gpio_write(GPIO_PIN, 1);   // release
-    udelay(70);
-    present = !gpio_read(GPIO_PIN); // presence = low
-    udelay(410);
-    return present;
-}
+def read_bit():
+    """ Đọc 1 bit từ bus """
+    GPIO.setup(PIN, GPIO.OUT)
+    GPIO.output(PIN, GPIO.LOW)
+    usleep(3)                 # ≥1µs
+    GPIO.setup(PIN, GPIO.IN)  # release bus
+    usleep(10)                # chờ DS18B20 trả bit
+    bit = GPIO.input(PIN)
+    usleep(53)                # hoàn tất slot
+    return bit
 
-// write 1 bit
-static void ow_write_bit(int bit) {
-    gpio_write(GPIO_PIN, 0);
-    if (bit) {
-        udelay(6);
-        gpio_write(GPIO_PIN, 1);
-        udelay(64);
-    } else {
-        udelay(60);
-        gpio_write(GPIO_PIN, 1);
-        udelay(10);
-    }
-}
+def write_byte(byte):
+    """ Gửi 8 bit, LSB trước """
+    for i in range(8):
+        write_bit((byte >> i) & 1)
+    usleep(5)
 
-// read 1 bit
-static int ow_read_bit(void) {
-    int bit;
-    gpio_write(GPIO_PIN, 0);
-    udelay(6);
-    gpio_write(GPIO_PIN, 1);
-    udelay(9);
-    bit = gpio_read(GPIO_PIN);
-    udelay(55);
-    return bit;
-}
+def read_byte():
+    """ Đọc 8 bit, LSB trước """
+    val = 0
+    for i in range(8):
+        if read_bit():
+            val |= 1 << i
+    return val
 
-// write one byte, LSB first
-static void ow_write_byte(uint8_t b) {
-    for (int i = 0; i < 8; i++) {
-        ow_write_bit(b & 1);
-        b >>= 1;
-    }
-}
+def read_temperature():
+    # 1) Reset + Presence
+    if not reset_pulse():
+        raise RuntimeError("Không nhận được presence pulse!")
 
-// read one byte, LSB first
-static uint8_t ow_read_byte(void) {
-    uint8_t b = 0;
-    for (int i = 0; i < 8; i++) {
-        if (ow_read_bit()) b |= (1 << i);
-    }
-    return b;
-}
+    # 2) Skip ROM + Convert T
+    write_byte(SKIP_ROM)
+    write_byte(CONVERT_T)
+    # Chờ tối đa 750ms (12-bit). Có thể poll bus, nhưng đơn giản dùng delay:
+    time.sleep(0.75)
 
-// read temperature from DS18B20 (skip ROM)
-float ds18b20_read_temp(void) {
-    uint8_t temp_lsb, temp_msb;
-    if (!ow_reset()) {
-        fprintf(stderr, "No device present!\n");
-        return NAN;
-    }
-    ow_write_byte(0xCC);  // Skip ROM
-    ow_write_byte(0x44);  // Convert T
-    // wait conversion: tối đa 750ms cho 12-bit
-    usleep(750000);
+    # 3) Reset + Presence
+    if not reset_pulse():
+        raise RuntimeError("Không nhận được presence pulse lần 2!")
 
-    if (!ow_reset()) {
-        fprintf(stderr, "No device on read!\n");
-        return NAN;
-    }
-    ow_write_byte(0xCC);
-    ow_write_byte(0xBE);  // Read Scratchpad
+    # 4) Skip ROM + Read Scratchpad
+    write_byte(SKIP_ROM)
+    write_byte(READ_SCRATCHPAD)
 
-    temp_lsb = ow_read_byte();
-    temp_msb = ow_read_byte();
-    // bỏ qua 7 byte còn lại (CRC...)
-    for (int i = 0; i < 7; i++) ow_read_byte();
+    # 5) Đọc 9 byte
+    data = [read_byte() for _ in range(9)]
 
-    int16_t raw = (temp_msb << 8) | temp_lsb;
-    return raw / 16.0f;   // 12-bit resolution
-}
+    # 6) CRC bạn có thể kiểm tra ở đây (byte 8)
+    # Bỏ qua CRC check trong ví dụ này
 
-int main() {
-    int mem_fd;
-    void *gpio_map;
+    # 7) Tính nhiệt độ
+    raw = (data[1] << 8) | data[0]
+    # Chuyển signed
+    if raw & 0x8000:
+        raw = -((raw ^ 0xFFFF) + 1)
+    temp_c = raw / 16.0
+    return temp_c
 
-    // mở /dev/gpiomem để mmap
-    if ((mem_fd = open("/dev/gpiomem", O_RDWR | O_SYNC)) < 0) {
-        perror("open /dev/gpiomem");
-        return 1;
-    }
-    gpio_map = mmap(NULL, BLOCK_SIZE, PROT_READ|PROT_WRITE, MAP_SHARED, mem_fd, 0);
-    close(mem_fd);
-    if (gpio_map == MAP_FAILED) {
-        perror("mmap");
-        return 1;
-    }
-    gpio = (volatile uint32_t *)gpio_map;
-
-    // main loop
-    while (1) {
-        float temp = ds18b20_read_temp();
-        if (!isnan(temp)) {
-            printf("Temperature: %.3f °C\n", temp);
-        }
-        sleep(1);
-    }
-
-    munmap(gpio_map, BLOCK_SIZE);
-    return 0;
-}
+if __name__ == "__main__":
+    try:
+        init_gpio()
+        while True:
+            temp = read_temperature()
+            print(f"Nhiệt độ hiện tại: {temp:.3f} °C")
+            time.sleep(1)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        deinit_gpio()
