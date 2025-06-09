@@ -11,7 +11,7 @@ READ_SCRATCHPAD = 0xBE
 
 def usleep(micro):
     """Sleep micro giây"""
-    time.sleep(micro / 1_000_000.0)
+    time.sleep(micro / 1000000.0)
 
 def init_gpio():
     GPIO.setmode(GPIO.BCM)
@@ -38,9 +38,11 @@ def reset_pulse():
     start = time.time()
     while (time.time() - start) < 0.0003:
         if GPIO.input(PIN) == 0:
-            presence = True
+            presence = True            
             break
     # Hoàn tất slot bằng cách chờ thêm ~200 µs
+    if presence == True:
+        print('da xong reset_pulse()')
     usleep(200)
     return presence
 
@@ -90,12 +92,15 @@ def read_temperature():
     # --- Bước 2: Skip ROM + Convert T
     write_byte(SKIP_ROM)
     write_byte(CONVERT_T)
+    print('da gui convert T')
     # Chờ tối đa 750 ms cho conversion độ phân giải 12-bit
-    time.sleep(0.75)
-
-    # --- Bước 3: Reset & Presence lại
-    if not reset_pulse():
-        raise RuntimeError("Không nhận được presence pulse lần 2!")
+    for _ in range(1000):
+        if read_bit():
+            break
+        usleep(100)
+    else:
+        raise RuntimerError('time out converting')
+ 
 
     # --- Bước 4: Skip ROM + Read Scratchpad
     write_byte(SKIP_ROM)
@@ -107,26 +112,21 @@ def read_temperature():
 
     lsb, msb = scratch[0], scratch[1]
     raw = (msb << 8) | lsb
-    # Chuyển signed
-    if raw & 0x8000:
-        raw = -((raw ^ 0xFFFF) + 1)
+    if raw > 0x7FFF:
+        raw -= 1 <<16
 
-    # Lấy resolution từ byte 4: bits [6:5]
-    res_bits = (scratch[4] >> 5) & 0x03
-    resolution = 9 + res_bits
-    fraction_bits = resolution - 1
-
-    temp_c = raw / (2 ** fraction_bits)
-    return temp_c, resolution
+    temp_c = raw / 16.0
+    return temp_c
 
 if __name__ == "__main__":
     try:
         init_gpio()
         while True:
-            temp, res = read_temperature()
-            print(f"Độ phân giải: {res}-bit → Nhiệt độ: {temp:.4f} °C\n")
+            temp = read_temperature()
+            print(f"Nhiệt độ: {temp:.4f} °C\n")
             time.sleep(1)
     except KeyboardInterrupt:
         print("Kết thúc đo.")
     finally:
         deinit_gpio()
+
