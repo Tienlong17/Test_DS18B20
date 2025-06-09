@@ -1,158 +1,140 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
+#include <wiringPi.h>
 #include <unistd.h>
-#include <fcntl.h>
-#include <string.h>
-#include <time.h>
 
-#define GPIO_PIN "4" // GPIO4 (BCM numbering)
-#define GPIO_PATH "/sys/class/gpio"
-#define DELAY_US(x) usleep(x) // microseconds
+#define DQ_PIN 7  // wiringPi pin 7 = BCM GPIO4
 
-void gpio_export(const char *pin) {
-    char path[64];
-    int fd = open(GPIO_PATH "/export", O_WRONLY);
-    if (fd < 0) return;
-    write(fd, pin, strlen(pin));
-    close(fd);
+#define SKIP_ROM        0xCC
+#define CONVERT_T       0x44
+#define READ_SCRATCHPAD 0xBE
+
+void usleep_safe(unsigned int microseconds) {
+    usleep(microseconds);
 }
 
-void gpio_unexport(const char *pin) {
-    char path[64];
-    int fd = open(GPIO_PATH "/unexport", O_WRONLY);
-    if (fd < 0) return;
-    write(fd, pin, strlen(pin));
-    close(fd);
+void pin_output() {
+    pinMode(DQ_PIN, OUTPUT);
 }
 
-void gpio_direction(const char *pin, const char *dir) {
-    char path[64];
-    snprintf(path, sizeof(path), GPIO_PATH "/gpio%s/direction", pin);
-    int fd = open(path, O_WRONLY);
-    if (fd < 0) return;
-    write(fd, dir, strlen(dir));
-    close(fd);
+void pin_input() {
+    pinMode(DQ_PIN, INPUT);
 }
 
-void gpio_write(const char *pin, int value) {
-    char path[64], val = value ? '1' : '0';
-    snprintf(path, sizeof(path), GPIO_PATH "/gpio%s/value", pin);
-    int fd = open(path, O_WRONLY);
-    if (fd < 0) return;
-    write(fd, &val, 1);
-    close(fd);
+void write_low() {
+    digitalWrite(DQ_PIN, LOW);
 }
 
-int gpio_read(const char *pin) {
-    char path[64], val;
-    snprintf(path, sizeof(path), GPIO_PATH "/gpio%s/value", pin);
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) return -1;
-    read(fd, &val, 1);
-    close(fd);
-    return val == '1';
+void write_high() {
+    digitalWrite(DQ_PIN, HIGH);
 }
 
-void delay_us(unsigned int us) {
-    struct timespec ts;
-    ts.tv_sec = us / 1000000;
-    ts.tv_nsec = (us % 1000000) * 1000;
-    nanosleep(&ts, NULL);
+int reset_pulse() {
+    pin_output();
+    write_low();
+    usleep_safe(500); // ≥480µs
+
+    write_high();
+    pin_input();
+    usleep_safe(70); // đợi presence
+
+    int presence = digitalRead(DQ_PIN) == 0;
+    usleep_safe(430); // còn lại ~500µs
+
+    return presence;
 }
 
-// 1-Wire reset, trả về 1 nếu DS18B20 có mặt, 0 nếu không
-int onewire_reset(const char *pin) {
-    gpio_direction(pin, "out");
-    gpio_write(pin, 0);
-    delay_us(480);
-    gpio_direction(pin, "in");
-    delay_us(70);
-    int present = !gpio_read(pin);
-    delay_us(410);
-    return present;
-}
+void write_bit(int bit) {
+    pin_output();
+    write_low();
 
-void onewire_write_bit(const char *pin, int bit) {
-    gpio_direction(pin, "out");
-    gpio_write(pin, 0);
     if (bit) {
-        delay_us(6);
-        gpio_direction(pin, "in");
-        delay_us(64);
+        usleep_safe(10);
+        write_high();
+        usleep_safe(55);
     } else {
-        delay_us(60);
-        gpio_direction(pin, "in");
-        delay_us(10);
+        usleep_safe(65);
+        write_high();
+        usleep_safe(5);
     }
 }
 
-int onewire_read_bit(const char *pin) {
-    int bit;
-    gpio_direction(pin, "out");
-    gpio_write(pin, 0);
-    delay_us(6);
-    gpio_direction(pin, "in");
-    delay_us(9);
-    bit = gpio_read(pin);
-    delay_us(55);
+int read_bit() {
+    pin_output();
+    write_low();
+    usleep_safe(2);
+
+    pin_input();
+    usleep_safe(12);
+    int bit = digitalRead(DQ_PIN);
+    usleep_safe(50);
+
     return bit;
 }
 
-void onewire_write_byte(const char *pin, unsigned char byte) {
-    for (int i = 0; i < 8; ++i)
-        onewire_write_bit(pin, (byte >> i) & 1);
+void write_byte(uint8_t byte) {
+    for (int i = 0; i < 8; i++) {
+        write_bit((byte >> i) & 1);
+    }
+    usleep_safe(5);
 }
 
-unsigned char onewire_read_byte(const char *pin) {
-    unsigned char byte = 0;
-    for (int i = 0; i < 8; ++i)
-        if (onewire_read_bit(pin))
-            byte |= (1 << i);
-    return byte;
+uint8_t read_byte() {
+    uint8_t val = 0;
+    for (int i = 0; i < 8; i++) {
+        if (read_bit()) {
+            val |= (1 << i);
+        }
+    }
+    return val;
 }
 
-float ds18b20_read_temp(const char *pin) {
-    unsigned char scratchpad[9];
-    int temp_raw;
-
-    // 1. Reset & Skip ROM & Convert T
-    if (!onewire_reset(pin)) {
-        printf("Sensor not detected.\n");
+float read_temperature() {
+    if (!reset_pulse()) {
+        fprintf(stderr, "Không có presence lần 1!\n");
         return -999;
     }
-    onewire_write_byte(pin, 0xCC); // Skip ROM
-    onewire_write_byte(pin, 0x44); // Convert T
-    sleep(1); // Chờ chuyển đổi (max 750ms)
 
-    // 2. Reset & Skip ROM & Read Scratchpad
-    if (!onewire_reset(pin)) {
-        printf("Sensor not detected.\n");
+    write_byte(SKIP_ROM);
+    write_byte(CONVERT_T);
+
+    // Đợi convert xong (~750ms)
+    for (int i = 0; i < 1000; i++) {
+        if (read_bit()) break;
+        usleep_safe(1000); // 1ms
+    }
+
+    if (!reset_pulse()) {
+        fprintf(stderr, "Không có presence lần 2!\n");
         return -999;
     }
-    onewire_write_byte(pin, 0xCC); // Skip ROM
-    onewire_write_byte(pin, 0xBE); // Read Scratchpad
 
-    for (int i = 0; i < 9; ++i)
-        scratchpad[i] = onewire_read_byte(pin);
+    write_byte(SKIP_ROM);
+    write_byte(READ_SCRATCHPAD);
 
-    temp_raw = (scratchpad[1] << 8) | scratchpad[0];
-    // Xử lý số âm
-    if (temp_raw & 0x8000) temp_raw = (temp_raw ^ 0xFFFF) + 1, temp_raw = -temp_raw;
-    return temp_raw / 16.0;
+    uint8_t scratch[9];
+    for (int i = 0; i < 9; i++) {
+        scratch[i] = read_byte();
+    }
+
+    int16_t raw = (scratch[1] << 8) | scratch[0];
+    if (raw & 0x8000) raw = raw - 0x10000;
+
+    return raw / 16.0;
 }
 
 int main() {
-    gpio_export(GPIO_PIN);
-    usleep(100000); // Đợi cho Pi export xong
-    printf("Đang đọc nhiệt độ...\n");
-    for (int i = 0; i < 10; ++i) {
-        float temp = ds18b20_read_temp(GPIO_PIN);
-        if (temp > -100)
-            printf("Nhiet do: %.2f C\n", temp);
-        else
-            printf("Khong tim thay cam bien!\n");
+    if (wiringPiSetup() == -1) {
+        fprintf(stderr, "Không khởi tạo được wiringPi\n");
+        return 1;
+    }
+
+    while (1) {
+        float temp = read_temperature();
+        printf("Nhiệt độ: %.4f °C\n", temp);
         sleep(1);
     }
-    gpio_unexport(GPIO_PIN);
+
     return 0;
 }
